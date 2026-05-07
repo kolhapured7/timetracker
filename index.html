@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>TimeTrack</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:Inter,-apple-system,sans-serif;background:#f8fafc;color:#1e293b;min-height:100vh}
+  input,select,button{font-family:inherit}
+  ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#f1f5f9}::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:4px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, query, where, orderBy } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ── Your Firebase Config ──────────────────────────────────────────────────────
+const firebaseConfig = {
+  apiKey: "AIzaSyBtnWl-vQzf-WFvf4VrviaYVpfo3kuh854",
+  authDomain: "timetrack0.firebaseapp.com",
+  databaseURL: "https://timetrack0-default-rtdb.firebaseio.com",
+  projectId: "timetrack0",
+  storageBucket: "timetrack0.firebasestorage.app",
+  messagingSenderId: "397719844690",
+  appId: "1:397719844690:web:e829344bc32915df58ac8b"
+};
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const CATS   = ["Study","Work","Break","Exercise","Personal","Meeting","Reading","Timepass","Other"];
+const COLORS = {Study:"#6366f1",Work:"#f59e0b",Break:"#10b981",Exercise:"#ef4444",Personal:"#3b82f6",Meeting:"#a855f7",Reading:"#f97316",Timepass:"#94a3b8",Other:"#14b8a6"};
+const cc     = c => COLORS[c] || "#14b8a6";
+const SLOTS  = Array.from({length:96},(_,i)=>{
+  const h=Math.floor(i/4), m=(i%4)*15;
+  return { value:`${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`,
+           label:`${h===0?12:h>12?h-12:h}:${m===0?"00":m} ${h<12?"AM":"PM"}` };
+});
+
+const todayStr = () => new Date().toISOString().split("T")[0];
+const wkKey    = d => { const dt=new Date(d+"T00:00:00"),day=dt.getDay(),m=new Date(dt); m.setDate(dt.getDate()-day+(day===0?-6:1)); return m.toISOString().split("T")[0]; };
+const moKey    = d => d.slice(0,7);
+const si       = t => { const[h,m]=t.split(":").map(Number); return h*4+Math.floor(m/15); };
+const dh       = (s,e) => { let d=si(e)-si(s); if(d<=0)d+=96; return+(d/4).toFixed(2); };
+const $        = id => document.getElementById(id);
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let state = {
+  user:null, authReady:false, tab:"log",
+  entries:[], formErr:"", savedFlash:false, savingEntry:false,
+  form:{date:todayStr(),start:"",end:"",cat:"Study",custom:"",note:""},
+  authMode:"login", authName:"", authEmail:"", authPw:"",
+  authErr:"", authLoading:false, showPw:false, wheelOpen:null
+};
+let unsubEntries = null;
+
+function setState(patch){ Object.assign(state,patch); render(); }
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  if(unsubEntries){ unsubEntries(); unsubEntries=null; }
+  if(user){
+    setState({user, authReady:true, entries:[]});
+    const q = query(collection(db,"entries"), where("uid","==",user.uid), orderBy("date","desc"), orderBy("start","asc"));
+    unsubEntries = onSnapshot(q, snap => setState({entries: snap.docs.map(d=>({id:d.id,...d.data()}))}));
+  } else {
+    setState({user:null, authReady:true, entries:[]});
+  }
+});
+
+async function doSignup(){
+  const {authName,authEmail,authPw}=state;
+  if(!authName.trim())                              return setState({authErr:"Name is required."});
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail)) return setState({authErr:"Enter a valid email."});
+  if(authPw.length<6)                               return setState({authErr:"Password must be at least 6 characters."});
+  setState({authLoading:true,authErr:""});
+  try {
+    const cred = await createUserWithEmailAndPassword(auth,authEmail,authPw);
+    await updateProfile(cred.user,{displayName:authName.trim()});
+  } catch(e) {
+    setState({authErr: e.code==="auth/email-already-in-use"?"Account already exists.":e.message, authLoading:false});
+  }
+}
+
+async function doLogin(){
+  const {authEmail,authPw}=state;
+  if(!authEmail||!authPw) return setState({authErr:"All fields are required."});
+  setState({authLoading:true,authErr:""});
+  try {
+    await signInWithEmailAndPassword(auth,authEmail,authPw);
+  } catch(e) {
+    setState({authErr: ["auth/user-not-found","auth/wrong-password","auth/invalid-credential"].includes(e.code)?"Incorrect email or password.":e.message, authLoading:false});
+  }
+}
+
+async function doLogout(){ await signOut(auth); }
+
+// ── Entries ───────────────────────────────────────────────────────────────────
+async function addEntry(){
+  const {form,user,entries}=state;
+  if(!form.start||!form.end)    return setState({formErr:"Please select both times."});
+  if(form.start===form.end)     return setState({formErr:"Start and end can't be the same."});
+  const hrs = dh(form.start,form.end);
+  if(hrs<=0)                    return setState({formErr:"End must be after start."});
+  const cat = form.cat==="Other"?(form.custom.trim()||"Other"):form.cat;
+  const dateE = entries.filter(e=>e.date===form.date).sort((a,b)=>si(a.start)-si(b.start));
+  const lastEnd = dateE.reduce((max,e)=>{ const ei=si(e.end); return ei>max?ei:max; },-1);
+  const batch = [];
+  if(lastEnd>=0 && si(form.start)>lastEnd){
+    const gHrs=dh(SLOTS[lastEnd].value,form.start);
+    if(gHrs>0) batch.push({uid:user.uid,date:form.date,start:SLOTS[lastEnd].value,end:form.start,category:"Timepass",note:"Auto-filled gap",hours:gHrs,ts:Date.now()-1});
+  }
+  batch.push({uid:user.uid,date:form.date,start:form.start,end:form.end,category:cat,note:form.note,hours:hrs,ts:Date.now()});
+  setState({formErr:"",savingEntry:true});
+  try {
+    for(const e of batch) await addDoc(collection(db,"entries"),e);
+    setState({form:{...state.form,start:"",end:"",note:"",custom:""},savingEntry:false,savedFlash:true});
+    setTimeout(()=>setState({savedFlash:false}),2000);
+  } catch(e){ setState({formErr:"Save failed: "+e.message,savingEntry:false}); }
+}
+
+async function delEntry(id){
+  try{ await deleteDoc(doc(db,"entries",id)); }
+  catch(e){ alert("Delete failed: "+e.message); }
+}
+
+// ── Clock Wheel ───────────────────────────────────────────────────────────────
+function openWheel(which){
+  setState({wheelOpen:which});
+  setTimeout(()=>{
+    const el=$("wheel-list-"+which);
+    if(!el) return;
+    const idx = state.form[which] ? SLOTS.findIndex(s=>s.value===state.form[which]) : 0;
+    el.scrollTop = Math.max(0,idx)*44-88;
+    el.addEventListener("scroll",()=>{
+      const i=Math.max(0,Math.min(95,Math.round((el.scrollTop+88)/44)));
+      state.form[which]=SLOTS[i].value;
+      const disp=$(which+"-display");
+      if(disp) disp.textContent=SLOTS[i].label;
+    },{passive:true});
+  },50);
+}
+
+function confirmWheel(which){
+  const el=$("wheel-list-"+which);
+  if(el){ state.form[which]=SLOTS[Math.max(0,Math.min(95,Math.round((el.scrollTop+88)/44)))].value; }
+  setState({wheelOpen:null});
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render(){
+  const root=$("root");
+  if(!state.authReady){
+    root.innerHTML=`<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#818cf8)"><div style="color:#fff;font-size:18px;font-weight:700">⏱ Loading…</div></div>`;
+    return;
+  }
+  root.innerHTML = state.user ? renderApp() : renderAuth();
+  if(!state.user) attachAuthEvents();
+  if(state.wheelOpen) attachWheelScroll();
+}
+
+// ── Auth Screen ───────────────────────────────────────────────────────────────
+function renderAuth(){
+  const {authMode,authErr,authLoading,showPw,authName,authEmail,authPw}=state;
+  return `
+  <div style="min-height:100vh;background:linear-gradient(135deg,#6366f1 0%,#818cf8 50%,#c7d2fe 100%);display:flex;align-items:center;justify-content:center;padding:16px">
+    <div style="width:100%;max-width:400px">
+      <div style="text-align:center;margin-bottom:28px">
+        <div style="font-size:48px;margin-bottom:8px">⏱</div>
+        <div style="font-weight:800;font-size:28px;color:#fff">TimeTrack</div>
+        <div style="color:#e0e7ff;font-size:14px;margin-top:6px">Your personal productivity journal</div>
+      </div>
+      <div style="background:#fff;border-radius:20px;padding:28px;box-shadow:0 20px 60px rgba(0,0,0,0.15)">
+        <div style="display:flex;background:#f1f5f9;border-radius:10px;padding:4px;margin-bottom:24px">
+          ${["login","signup"].map(m=>`<button onclick="switchAuthMode('${m}')" style="flex:1;padding:9px;border-radius:8px;border:none;background:${authMode===m?"#fff":"transparent"};color:${authMode===m?"#6366f1":"#64748b"};font-weight:${authMode===m?700:500};font-size:13px;cursor:pointer;box-shadow:${authMode===m?"0 1px 4px rgba(0,0,0,0.08)":"none"}">${m==="login"?"Sign In":"Create Account"}</button>`).join("")}
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          ${authMode==="signup"?`<input id="inp-name" type="text" placeholder="Full name" value="${authName}" style="padding:12px 14px;border-radius:10px;border:1.5px solid #e2e8f0;font-size:14px;outline:none;background:#f8fafc;width:100%"/>`:""}
+          <input id="inp-email" type="email" placeholder="Email address" value="${authEmail}" style="padding:12px 14px;border-radius:10px;border:1.5px solid #e2e8f0;font-size:14px;outline:none;background:#f8fafc;width:100%"/>
+          <div style="position:relative">
+            <input id="inp-pw" type="${showPw?"text":"password"}" placeholder="Password (min 6 chars)" value="${authPw}" style="padding:12px 44px 12px 14px;border-radius:10px;border:1.5px solid #e2e8f0;font-size:14px;outline:none;background:#f8fafc;width:100%"/>
+            <button onclick="togglePw()" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:18px;color:#94a3b8">${showPw?"🙈":"👁"}</button>
+          </div>
+        </div>
+        ${authErr?`<div style="margin-top:12px;padding:10px 12px;background:#fef2f2;border-radius:8px;color:#ef4444;font-size:13px">${authErr}</div>`:""}
+        <button id="auth-btn" style="width:100%;margin-top:16px;padding:13px;background:linear-gradient(135deg,#6366f1,#818cf8);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:15px;cursor:pointer">
+          ${authLoading?"Please wait…":authMode==="login"?"Sign In →":"Create Account →"}
+        </button>
+        <div style="text-align:center;margin-top:16px;font-size:13px;color:#94a3b8">
+          ${authMode==="login"?`Don't have an account? <span onclick="switchAuthMode('signup')" style="color:#6366f1;font-weight:600;cursor:pointer">Sign up</span>`:`Already have an account? <span onclick="switchAuthMode('login')" style="color:#6366f1;font-weight:600;cursor:pointer">Sign in</span>`}
+        </div>
+      </div>
+      <div style="text-align:center;margin-top:14px;font-size:12px;color:#c7d2fe">🔒 Powered by Firebase — syncs across all your devices</div>
+    </div>
+  </div>`;
+}
+
+function attachAuthEvents(){
+  const btn=$("auth-btn");
+  if(btn) btn.onclick=()=>state.authMode==="login"?doLogin():doSignup();
+  [$("inp-email"),$("inp-pw"),$("inp-name")].forEach(el=>{
+    if(el) el.addEventListener("input", e=>{ if(e.target.id==="inp-name") state.authName=e.target.value; else if(e.target.id==="inp-email") state.authEmail=e.target.value; else state.authPw=e.target.value; });
+    if(el) el.onkeydown=e=>{ if(e.key==="Enter") state.authMode==="login"?doLogin():doSignup(); };
+  });
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function renderApp(){
+  const {tab,user,form,savedFlash,savingEntry,formErr,wheelOpen}=state;
+  const tE=state.entries.filter(e=>e.date===todayStr()).sort((a,b)=>si(a.start)-si(b.start));
+  const wE=state.entries.filter(e=>wkKey(e.date)===wkKey(todayStr()));
+  const mE=state.entries.filter(e=>moKey(e.date)===moKey(todayStr()));
+  const todayHrs=tE.reduce((a,e)=>a+e.hours,0);
+  const weekHrs=wE.reduce((a,e)=>a+e.hours,0).toFixed(1);
+  const mPie={}; mE.forEach(e=>{mPie[e.category]=(mPie[e.category]||0)+e.hours;});
+  const topCat=Object.entries(mPie).sort((a,b)=>b[1]-a[1])[0]?.[0]||"—";
+  const startLbl=form.start?SLOTS.find(s=>s.value===form.start)?.label:"-- : --";
+  const endLbl=form.end?SLOTS.find(s=>s.value===form.end)?.label:"-- : --";
+
+  return `
+  <div style="min-height:100vh;background:#f8fafc">
+    <div style="background:linear-gradient(135deg,#6366f1,#818cf8);padding:16px 20px 0;box-shadow:0 2px 12px rgba(99,102,241,0.25)">
+      <div style="max-width:620px;margin:0 auto">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+          <span style="font-size:20px">⏱</span>
+          <span style="font-weight:700;font-size:17px;color:#fff">TimeTrack</span>
+          <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
+            <div style="background:rgba(255,255,255,0.2);border-radius:20px;padding:4px 12px;display:flex;align-items:center;gap:6px">
+              <div style="width:24px;height:24px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px;color:#6366f1">${(user.displayName||user.email)[0].toUpperCase()}</div>
+              <span style="color:#fff;font-size:12px;font-weight:600">${(user.displayName||user.email).split(" ")[0]}</span>
+            </div>
+            <button onclick="doLogout()" style="background:rgba(255,255,255,0.2);border:none;border-radius:8px;padding:6px 10px;color:#fff;font-size:12px;cursor:pointer;font-weight:600">↩ Out</button>
+          </div>
+        </div>
+        <div style="display:flex;gap:4px">
+          ${[["log","📋 Log"],["weekly","📊 Weekly"],["monthly","📅 Monthly"]].map(([t,l])=>`<button onclick="setTab('${t}')" style="background:${tab===t?"#fff":"transparent"};color:${tab===t?"#6366f1":"#e0e7ff"};border:none;border-radius:8px 8px 0 0;padding:8px 18px;font-weight:600;font-size:13px;cursor:pointer">${l}</button>`).join("")}
+        </div>
+      </div>
+    </div>
+
+    <div style="max-width:620px;margin:0 auto;padding:20px 16px">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:20px">
+        ${[["Today",`${todayHrs.toFixed(1)} / 24h`,"⏰"],["Week",`${weekHrs}h`,"📅"],["Top",topCat,"🏆"]].map(([l,v,ic])=>`
+        <div style="background:#fff;border-radius:12px;padding:12px 10px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,0.06)">
+          <div style="font-size:18px">${ic}</div>
+          <div style="font-weight:700;font-size:13px;color:#6366f1;margin-top:2px">${v}</div>
+          <div style="font-size:11px;color:#64748b;margin-top:1px">${l}</div>
+        </div>`).join("")}
+      </div>
+
+      ${tab==="log"?renderLog(tE,form,startLbl,endLbl,savedFlash,savingEntry,formErr):tab==="weekly"?renderWeekly(wE,weekHrs):renderMonthly(mE)}
+    </div>
+  </div>
+
+  ${wheelOpen?renderWheel(wheelOpen):""}`;
+}
+
+function renderLog(tE,form,startLbl,endLbl,savedFlash,savingEntry,formErr){
+  return `
+  <div style="background:#fff;border-radius:16px;padding:16px;box-shadow:0 1px 4px rgba(0,0,0,0.06);margin-bottom:16px">
+    <div style="font-weight:700;font-size:14px;margin-bottom:10px">🗓 Today's 24h Timeline</div>
+    <div style="display:flex;height:28px;border-radius:8px;overflow:hidden;gap:1px">
+      ${Array.from({length:24},(_,h)=>{ const e=tE.find(e=>si(e.start)<=h*4&&h*4<si(e.end)); return`<div title="${h}:00${e?` — ${e.category}`:""}" style="flex:1;background:${e?cc(e.category):"#f1f5f9"}"></div>`; }).join("")}
+    </div>
+    <div style="display:flex;justify-content:space-between;margin-top:4px;padding:0 2px">
+      ${["12a","3a","6a","9a","12p","3p","6p","9p"].map(l=>`<span style="font-size:9px;color:#94a3b8">${l}</span>`).join("")}
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+      ${[...new Set(tE.map(e=>e.category))].map(c=>`<span style="display:flex;align-items:center;gap:4px;font-size:11px;color:#475569"><span style="width:8px;height:8px;border-radius:50%;background:${cc(c)};display:inline-block"></span>${c}</span>`).join("")}
+      ${tE.length===0?'<span style="font-size:11px;color:#94a3b8">No entries yet</span>':""}
+    </div>
+  </div>
+
+  <div style="background:#fff;border-radius:16px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,0.06);margin-bottom:16px">
+    <div style="font-weight:700;font-size:15px;margin-bottom:14px">➕ Log Time</div>
+    <div style="margin-bottom:12px">
+      <label style="font-size:11px;color:#64748b;font-weight:600">DATE</label>
+      <input type="date" id="inp-date" value="${form.date}" style="width:100%;margin-top:4px;padding:9px 12px;border-radius:10px;border:1.5px solid #e2e8f0;font-size:13px;outline:none"/>
+    </div>
+    <div style="display:flex;gap:12px;margin-bottom:12px">
+      <div style="flex:1">
+        <div style="font-size:11px;color:#64748b;font-weight:600;margin-bottom:4px">START TIME</div>
+        <button onclick="openWheel('start')" style="width:100%;padding:10px 12px;border-radius:10px;border:1.5px solid #e2e8f0;background:#fff;font-weight:600;font-size:14px;cursor:pointer;color:${form.start?"#1e293b":"#94a3b8"};display:flex;align-items:center;justify-content:space-between">
+          <span id="start-display">${startLbl}</span><span>🕐</span>
+        </button>
+      </div>
+      <div style="flex:1">
+        <div style="font-size:11px;color:#64748b;font-weight:600;margin-bottom:4px">END TIME</div>
+        <button onclick="openWheel('end')" style="width:100%;padding:10px 12px;border-radius:10px;border:1.5px solid #e2e8f0;background:#fff;font-weight:600;font-size:14px;cursor:pointer;color:${form.end?"#1e293b":"#94a3b8"};display:flex;align-items:center;justify-content:space-between">
+          <span id="end-display">${endLbl}</span><span>🕐</span>
+        </button>
+      </div>
+    </div>
+    <div style="margin-bottom:12px">
+      <label style="font-size:11px;color:#64748b;font-weight:600">CATEGORY</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+        ${CATS.map(c=>`<button onclick="setCat('${c}')" style="padding:6px 12px;border-radius:20px;border:1.5px solid ${form.cat===c?cc(c):"#e2e8f0"};background:${form.cat===c?cc(c)+"28":"#fff"};color:${form.cat===c?cc(c):"#64748b"};font-weight:${form.cat===c?700:400};font-size:12px;cursor:pointer">${c}</button>`).join("")}
+      </div>
+    </div>
+    ${form.cat==="Other"?`<div style="margin-bottom:12px"><label style="font-size:11px;color:#64748b;font-weight:600">SPECIFY TASK</label><input id="inp-custom" placeholder="e.g. Cooking, Commute…" value="${form.custom}" style="width:100%;margin-top:4px;padding:9px 12px;border-radius:10px;border:1.5px solid #6366f1;font-size:13px;outline:none"/></div>`:""}
+    <div style="margin-bottom:12px">
+      <label style="font-size:11px;color:#64748b;font-weight:600">NOTE (optional)</label>
+      <input id="inp-note" placeholder="What did you work on?" value="${form.note}" style="width:100%;margin-top:4px;padding:9px 12px;border-radius:10px;border:1.5px solid #e2e8f0;font-size:13px;outline:none"/>
+    </div>
+    ${formErr?`<div style="color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px 10px;background:#fef2f2;border-radius:8px">${formErr}</div>`:""}
+    <button onclick="addEntry()" style="width:100%;background:linear-gradient(135deg,#6366f1,#818cf8);color:#fff;border:none;border-radius:10px;padding:12px;font-weight:700;font-size:14px;cursor:pointer">
+      ${savingEntry?"Saving…":savedFlash?"✅ Saved!":"Save Entry"}
+    </button>
+  </div>
+
+  <div style="background:#fff;border-radius:16px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,0.06)">
+    <div style="font-weight:700;font-size:15px;margin-bottom:12px">📋 Today's Log</div>
+    ${tE.length===0?'<div style="color:#94a3b8;font-size:13px;text-align:center;padding:20px 0">No entries yet. Start logging!</div>':
+      tE.map(e=>`
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #f1f5f9">
+        <div style="width:10px;height:36px;border-radius:4px;background:${cc(e.category)};flex-shrink:0"></div>
+        <div style="flex:1">
+          <div style="font-weight:600;font-size:13px">${e.category}</div>
+          ${e.note&&e.note!=="Auto-filled gap"?`<div style="font-size:11px;color:#64748b">${e.note}</div>`:""}
+          <div style="font-size:11px;color:#94a3b8">${e.start} → ${e.end}</div>
+        </div>
+        <div style="background:${cc(e.category)}22;border-radius:8px;padding:3px 10px;font-size:13px;font-weight:700;color:${cc(e.category)}">${e.hours}h</div>
+        <button onclick="delEntry('${e.id}')" style="background:none;border:none;cursor:pointer;color:#cbd5e1;font-size:16px;padding:0">✕</button>
+      </div>`).join("")}
+  </div>`;
+}
+
+function renderWeekly(wE, weekHrs){
+  const cats=[...new Set(wE.map(e=>e.category))];
+  const wk=wkKey(todayStr());
+  const days=Array.from({length:7},(_,i)=>{ const d=new Date(wk+"T00:00:00"); d.setDate(d.getDate()+i); return d.toISOString().split("T")[0]; });
+  const weekData=days.map(d=>{ const obj={day:new Date(d+"T00:00:00").toLocaleDateString("en",{weekday:"short"})}; wE.filter(e=>e.date===d).forEach(e=>{obj[e.category]=(obj[e.category]||0)+e.hours;}); return obj; });
+  if(cats.length===0) return `<div style="background:#fff;border-radius:16px;padding:40px;text-align:center;color:#94a3b8">No data this week yet.</div>`;
+  const maxH=Math.max(...weekData.map(d=>cats.reduce((s,c)=>s+(d[c]||0),0)),1);
+  const barW=44,gap=6,chartH=160,padL=28;
+  const totalW=days.length*(barW+gap)+padL+10;
+  const bars=weekData.map((d,i)=>{ let y=chartH; const x=padL+i*(barW+gap); return cats.map(c=>{ const h=(d[c]||0),bh=Math.round((h/maxH)*chartH); y-=bh; return h>0?`<rect x="${x}" y="${y}" width="${barW}" height="${bh}" fill="${cc(c)}" rx="2"/>`:""; }).join("")+`<text x="${x+barW/2}" y="${chartH+14}" text-anchor="middle" font-size="10" fill="#94a3b8">${d.day}</text>`; }).join("");
+  const yL=[0,Math.round(maxH/2),Math.round(maxH)].map(v=>`<text x="${padL-4}" y="${chartH-Math.round((v/maxH)*chartH)+4}" text-anchor="end" font-size="9" fill="#94a3b8">${v}h</text>`).join("");
+  return `
+  <div style="background:#fff;border-radius:16px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,0.06);margin-bottom:16px">
+    <div style="font-weight:700;font-size:15px;margin-bottom:16px">📊 This Week</div>
+    <svg width="100%" viewBox="0 0 ${totalW} ${chartH+20}" style="overflow:visible">${bars}${yL}</svg>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">${cats.map(c=>`<span style="display:flex;align-items:center;gap:4px;font-size:11px;color:#475569"><span style="width:8px;height:8px;border-radius:50%;background:${cc(c)};display:inline-block"></span>${c}</span>`).join("")}</div>
+  </div>
+  <div style="background:#fff;border-radius:16px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,0.06)">
+    <div style="font-weight:700;font-size:15px;margin-bottom:12px">Weekly Breakdown</div>
+    ${cats.map(c=>{ const hrs=wE.filter(e=>e.category===c).reduce((a,e)=>a+e.hours,0).toFixed(1); const pct=weekHrs>0?((hrs/weekHrs)*100).toFixed(0):0; return`<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px"><span style="font-weight:600;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:${cc(c)};display:inline-block"></span>${c}</span><span style="color:#64748b">${hrs}h &nbsp;${pct}%</span></div><div style="background:#f1f5f9;border-radius:99px;height:8px"><div style="background:${cc(c)};width:${pct}%;height:8px;border-radius:99px"></div></div></div>`; }).join("")}
+  </div>`;
+}
+
+function renderMonthly(mE){
+  const pie={}; mE.forEach(e=>{pie[e.category]=(pie[e.category]||0)+e.hours;});
+  const data=Object.entries(pie).map(([n,v])=>({n,v:+v.toFixed(2)})).sort((a,b)=>b.v-a.v);
+  const total=data.reduce((s,d)=>s+d.v,0);
+  if(data.length===0) return `<div style="background:#fff;border-radius:16px;padding:40px;text-align:center;color:#94a3b8">No data this month yet.</div>`;
+  const cx=100,cy=100,r=75,ri=45; let angle=-Math.PI/2;
+  const slices=data.map(d=>{ const sw=(d.v/total)*2*Math.PI,x1=cx+r*Math.cos(angle),y1=cy+r*Math.sin(angle); angle+=sw; const x2=cx+r*Math.cos(angle),y2=cy+r*Math.sin(angle),xi1=cx+ri*Math.cos(angle-sw),yi1=cy+ri*Math.sin(angle-sw),xi2=cx+ri*Math.cos(angle),yi2=cy+ri*Math.sin(angle),lg=sw>Math.PI?1:0; return`<path d="M${x1},${y1} A${r},${r} 0 ${lg},1 ${x2},${y2} L${xi2},${yi2} A${ri},${ri} 0 ${lg},0 ${xi1},${yi1} Z" fill="${cc(d.n)}"/>`; }).join("");
+  return `
+  <div style="background:#fff;border-radius:16px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,0.06)">
+    <div style="font-weight:700;font-size:15px;margin-bottom:16px">📅 ${new Date().toLocaleDateString("en",{month:"long",year:"numeric"})}</div>
+    <div style="display:flex;justify-content:center;margin-bottom:16px">
+      <svg width="200" height="200" viewBox="0 0 200 200">${slices}<text x="100" y="96" text-anchor="middle" font-size="18" font-weight="700" fill="#1e293b">${total.toFixed(1)}h</text><text x="100" y="112" text-anchor="middle" font-size="10" fill="#94a3b8">total logged</text></svg>
+    </div>
+    ${data.map(d=>`<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #f1f5f9"><div style="width:10px;height:10px;border-radius:50%;background:${cc(d.n)}"></div><span style="flex:1;font-size:13px;font-weight:600">${d.n}</span><span style="font-size:13px;color:#6366f1;font-weight:700">${d.v}h</span><span style="font-size:12px;color:#94a3b8">${total>0?((d.v/total)*100).toFixed(1):0}%</span></div>`).join("")}
+    <div style="display:flex;justify-content:space-between;padding:10px 0;font-weight:700;font-size:13px"><span>Total Logged</span><span style="color:#6366f1">${total.toFixed(1)}h</span></div>
+  </div>`;
+}
+
+function renderWheel(which){
+  const idx=state.form[which]?SLOTS.findIndex(s=>s.value===state.form[which]):0;
+  return `
+  <div onclick="setState({wheelOpen:null})" style="position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:998;display:flex;align-items:flex-end;justify-content:center">
+    <div onclick="event.stopPropagation()" style="background:#fff;border-radius:20px 20px 0 0;width:100%;max-width:420px;overflow:hidden">
+      <div style="background:linear-gradient(135deg,#6366f1,#818cf8);color:#fff;text-align:center;padding:14px;font-weight:700;font-size:15px">Select ${which==="start"?"Start":"End"} Time</div>
+      <div style="position:relative;height:220px">
+        <div style="position:absolute;top:50%;transform:translateY(-50%);left:0;right:0;height:44px;background:#6366f115;border-top:2px solid #6366f140;border-bottom:2px solid #6366f140;pointer-events:none;z-index:1"></div>
+        <div id="wheel-list-${which}" style="height:220px;overflow-y:scroll;scroll-snap-type:y mandatory;padding-top:88px;padding-bottom:88px">
+          ${SLOTS.map((s,i)=>`<div onclick="state.form['${which}']='${s.value}';confirmWheel('${which}')" style="height:44px;display:flex;align-items:center;justify-content:center;scroll-snap-align:center;cursor:pointer;font-size:16px;font-weight:${idx===i?700:400};color:${idx===i?"#6366f1":"#334155"}">${s.label}</div>`).join("")}
+        </div>
+      </div>
+      <div style="padding:12px 16px;display:flex;gap:8px">
+        <button onclick="confirmWheel('${which}')" style="flex:1;background:linear-gradient(135deg,#6366f1,#818cf8);color:#fff;border:none;border-radius:10px;padding:12px;font-weight:700;font-size:14px;cursor:pointer">Confirm</button>
+        <button onclick="setState({wheelOpen:null})" style="flex:1;background:#f1f5f9;color:#64748b;border:none;border-radius:10px;padding:12px;font-weight:600;font-size:14px;cursor:pointer">Cancel</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function attachWheelScroll(){
+  setTimeout(()=>{
+    const which=state.wheelOpen;
+    const el=$("wheel-list-"+which);
+    if(!el) return;
+    const idx=state.form[which]?SLOTS.findIndex(s=>s.value===state.form[which]):0;
+    el.scrollTop=Math.max(0,idx)*44-88;
+    el.addEventListener("scroll",()=>{
+      const i=Math.max(0,Math.min(95,Math.round((el.scrollTop+88)/44)));
+      state.form[which]=SLOTS[i].value;
+      const disp=$(which+"-display");
+      if(disp) disp.textContent=SLOTS[i].label;
+    },{passive:true});
+  },50);
+}
+
+// ── Inline input listeners (attached after each render) ───────────────────────
+const origRender=render;
+window.render=function(){
+  origRender();
+  const d=$("inp-date"); if(d) d.oninput=e=>state.form.date=e.target.value;
+  const n=$("inp-note"); if(n) n.oninput=e=>state.form.note=e.target.value;
+  const cu=$("inp-custom"); if(cu) cu.oninput=e=>state.form.custom=e.target.value;
+};
+
+// ── Global handlers ───────────────────────────────────────────────────────────
+window.state=state; window.setState=setState;
+window.switchAuthMode=m=>setState({authMode:m,authErr:""});
+window.togglePw=()=>setState({showPw:!state.showPw});
+window.setTab=t=>setState({tab:t});
+window.setCat=c=>setState({form:{...state.form,cat:c,custom:""}});
+window.openWheel=openWheel; window.confirmWheel=confirmWheel;
+window.addEntry=addEntry; window.delEntry=delEntry; window.doLogout=doLogout;
+
+render();
+</script>
+</body>
+</html>
